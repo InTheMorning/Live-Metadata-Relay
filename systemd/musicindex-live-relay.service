@@ -1,0 +1,17 @@
+[Unit]
+Description=MusicIndex live metadata relay
+After=network.target
+
+[Service]
+Type=simple
+Environment=BIND=127.0.0.1:8018
+ExecStart=/usr/local/bin/musicindex-live-relay
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

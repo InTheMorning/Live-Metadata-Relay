@@ -38,7 +38,10 @@ async fn create_event(router: axum::Router) -> CreateEventResponse {
         .expect("create response");
 
     assert_eq!(response.status(), StatusCode::OK);
-    read_json(response).await
+    let created: CreateEventResponse = read_json(response).await;
+    assert!(created.socket_io_url.starts_with("/event?event_id="));
+    assert!(created.remote_value_url.ends_with("/remoteValue"));
+    created
 }
 
 async fn create_event_at(router: axum::Router, uri: &str) -> CreateEventResponse {

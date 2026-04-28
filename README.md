@@ -1,17 +1,22 @@
 # MusicIndex Live Relay
 
-`musicindex-live-relay` is a small Rust service for relaying live metadata updates over HTTP and server-sent events.
+`musicindex-live-relay` is a small Rust service for relaying live metadata updates over HTTP, Socket.IO, and server-sent events.
 
-The service is intentionally memory-only for v1. Clients create a live item, receive a one-time broadcaster token, publish metadata with that token, and public listeners can read the latest snapshot or subscribe to updates over SSE.
+The service is intentionally memory-only for v1. Clients create a live item, receive a one-time broadcaster token, publish metadata with that token, and public listeners can receive `remoteValue` updates over Socket.IO. HTTP snapshot reads and SSE are kept as fallback/debug transports.
 
-## Service
+## Service Routes
 
-By default the relay binds to `127.0.0.1:8018` and is intended to sit behind nginx at:
+By default the relay binds to `127.0.0.1:8018`. It serves these routes at whatever origin and path layout the host chooses to expose:
 
 ```text
-/v1/liveitems
-/v1/liveitems/*
+POST /v1/liveitems
+GET  /v1/liveitems/{event_id}/metadata
+GET  /v1/liveitems/{event_id}/remoteValue
+GET  /v1/liveitems/{event_id}/events
+GET  /socket.io/*
 ```
+
+The public URLs advertised in RSS should be based on the deployment's external origin. The `api.musicindex.org` examples below show the MusicIndex deployment, not a hosting requirement.
 
 All state is process-local. Restarting the process drops live items, broadcaster tokens, latest snapshots, and replay buffers.
 
@@ -32,7 +37,9 @@ Response:
   "event_id": "<random opaque id>",
   "broadcaster_token": "<random secret token>",
   "metadata_url": "/v1/liveitems/<event_id>/metadata",
-  "events_url": "/v1/liveitems/<event_id>/events"
+  "remote_value_url": "/v1/liveitems/<event_id>/remoteValue",
+  "events_url": "/v1/liveitems/<event_id>/events",
+  "socket_io_url": "/event?event_id=<event_id>"
 }
 ```
 
@@ -82,7 +89,7 @@ For compatibility with the widely used Socket.IO live value implementation, the 
 }
 ```
 
-On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, and broadcasts an SSE `remoteValue` event whose JSON data is the raw live value payload.
+On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, broadcasts a Socket.IO `remoteValue` event, and also broadcasts the same raw payload over SSE for fallback clients.
 
 Response:
 
@@ -128,14 +135,52 @@ The Socket.IO-compatible raw payload is also available at:
 GET /v1/liveitems/{event_id}/remoteValue
 ```
 
-### Subscribe To Metadata Events
+### Subscribe With Socket.IO
+
+Socket.IO is the primary app-facing transport because it matches the existing live value implementation used by The Split Kit.
+
+Connect to namespace `/event` with `event_id` in the query string. Replace the origin with the relay host's public origin:
+
+```js
+import { io } from "socket.io-client";
+
+const socket = io("https://api.musicindex.org/event", {
+  query: { event_id: "<event_id>" }
+});
+
+socket.on("remoteValue", payload => {
+  applyRemoteValue(payload);
+});
+```
+
+The relay immediately emits the current `remoteValue` payload after a successful connection. If no metadata has been published yet, it emits `{}`. Future publishes emit the raw live value payload:
+
+```json
+{
+  "title": "...",
+  "image": "...",
+  "line": ["..."],
+  "value": {
+    "model": {
+      "type": "lightning",
+      "method": "keysend"
+    },
+    "destinations": []
+  },
+  "type": "person"
+}
+```
+
+The Socket.IO server uses namespace `/event` and the standard Engine.IO request path `/socket.io`.
+
+### Subscribe With SSE
 
 ```http
 GET /v1/liveitems/{event_id}/events
 Accept: text/event-stream
 ```
 
-The SSE stream is public. Each metadata update is emitted with the same event name and data shape used by the Socket.IO live value implementation:
+The SSE stream is public and is intended as a fallback/debug transport. Each metadata update is emitted with the same event name and data shape used by the Socket.IO live value implementation:
 
 ```text
 event: remoteValue
@@ -184,41 +229,50 @@ For this relay, the recommended RSS shape is:
   </podcast:value>
 
   <podcast:liveValue
-      uri="https://api.musicindex.org/v1/liveitems/GCeSvW8qLdzSdXO9rrlKGg"
-      protocol="sse" />
+      uri="https://api.musicindex.org/event?event_id=GCeSvW8qLdzSdXO9rrlKGg"
+      protocol="socket.io" />
 </podcast:liveItem>
 ```
 
 Only the public event URI belongs in RSS. The broadcaster token returned by
 `POST /v1/liveitems` is a write credential and must remain private. The relay
-uses SSE as the transport, but the event name and payload intentionally mirror
-the current Socket.IO `remoteValue` convention so app-side value handling can be
-shared.
+uses Socket.IO as the compatibility transport and emits the current
+`remoteValue` payload on the `/event` namespace.
 
 ### Event URI Convention
 
-Use the base live item URI in the tag:
+Use the Socket.IO namespace URI from the create response in the tag:
 
 ```xml
 <podcast:liveValue
-    uri="https://api.musicindex.org/v1/liveitems/<event_id>"
-    protocol="sse" />
+    uri="https://api.musicindex.org/event?event_id=<event_id>"
+    protocol="socket.io" />
 ```
 
-Apps derive the two public read endpoints from that base URI:
+Apps connect with the standard Socket.IO client:
+
+```js
+const socket = io("https://api.musicindex.org/event", {
+  query: { event_id: "<event_id>" }
+});
+
+socket.on("remoteValue", applyRemoteValue);
+```
+
+The HTTP fallback/debug endpoints are:
 
 ```text
-GET <uri>/metadata     wrapped current snapshot
-GET <uri>/remoteValue  raw current remoteValue payload
-GET <uri>/events       SSE stream of remoteValue events
+GET /v1/liveitems/<event_id>/metadata     wrapped current snapshot
+GET /v1/liveitems/<event_id>/remoteValue  raw current remoteValue payload
+GET /v1/liveitems/<event_id>/events       SSE stream of remoteValue events
 ```
 
-The snapshot endpoint matters because podcast apps may start playback in the
-middle of a live show, reconnect after losing network, or run in a mobile
-background mode where a persistent SSE connection is not reliable. Apps should
-read `/metadata` when playback starts, then subscribe to `/events` while they
-can keep a live connection open. If the stream disconnects, the app can reconnect
-with `Last-Event-ID` or poll `/metadata` as a conservative fallback.
+The relay sends the current payload immediately on Socket.IO connect. The HTTP
+snapshot endpoints are still useful for debugging, startup checks, and mobile
+background modes where the app may choose to poll instead of keeping a live
+connection open. If Socket.IO disconnects, the Socket.IO client handles
+reconnection. Apps can also poll `/remoteValue` or `/metadata` as a conservative
+fallback.
 
 The direct SSE URL form is also possible:
 
@@ -228,8 +282,8 @@ The direct SSE URL form is also possible:
     protocol="sse" />
 ```
 
-The base URI form is preferred because it gives apps both the current snapshot
-and event stream without inventing extra attributes.
+The Socket.IO form is preferred for app compatibility. The SSE form remains
+available for clients that deliberately choose the simpler one-way transport.
 
 ### `remoteValue` Payload
 
@@ -340,18 +394,34 @@ systemd/musicindex-live-relay.service
 
 The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, and restarts on failure.
 
-The intended nginx routing is:
+The relay can be exposed directly or behind any reverse proxy that preserves the service routes. MusicIndex currently deploys it behind nginx at `api.musicindex.org`; that deployment uses:
 
 - `/v1/liveitems` proxies to `127.0.0.1:8018`.
 - `/v1/liveitems/` proxies to `127.0.0.1:8018`.
+- `/socket.io/` proxies to `127.0.0.1:8018`.
 - Other API routes continue to the existing Stophammer service.
 
-Example nginx locations:
+Example nginx locations for that split deployment:
 
 ```nginx
 location = /v1/liveitems {
     proxy_pass http://127.0.0.1:8018;
     proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location ^~ /socket.io/ {
+    proxy_pass http://127.0.0.1:8018;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -369,10 +439,13 @@ location ^~ /v1/liveitems/ {
     proxy_buffering off;
     proxy_cache off;
     proxy_read_timeout 1h;
+
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
 }
 ```
 
-The `proxy_pass` target intentionally has no trailing slash so nginx preserves `/v1/liveitems/...` when forwarding to the relay.
+The `proxy_pass` target intentionally has no trailing slash so nginx preserves the relay paths when forwarding to the service.
 
 If nginx returns `502 Bad Gateway` for `/v1/liveitems`, nginx is matching the route but cannot reach the relay on `127.0.0.1:8018`. Check the service on the host:
 
@@ -382,6 +455,7 @@ sudo journalctl -u musicindex-live-relay -n 100 --no-pager
 ss -ltnp | grep 8018
 curl -i http://127.0.0.1:8018/health
 curl -i -X POST http://127.0.0.1:8018/v1/liveitems
+curl -i 'http://127.0.0.1:8018/socket.io/?EIO=4&transport=polling'
 ```
 
 After the relay is listening locally, reload nginx and verify the proxied health route:

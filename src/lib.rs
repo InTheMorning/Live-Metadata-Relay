@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, RwLock as StdRwLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -11,7 +11,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State as AxumState},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -23,6 +23,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use socketioxide::{
+    SocketIo,
+    extract::{SocketRef, State as SocketState},
+};
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{RwLock, broadcast};
@@ -114,6 +118,7 @@ struct RelayStateInner {
     config: AppConfig,
     events: RwLock<HashMap<String, Arc<LiveEventState>>>,
     sse_connections: AtomicUsize,
+    socket_io: StdRwLock<Option<SocketIo>>,
     clock: Clock,
 }
 
@@ -130,6 +135,7 @@ impl RelayState {
                 config,
                 events: RwLock::new(HashMap::new()),
                 sse_connections: AtomicUsize::new(0),
+                socket_io: StdRwLock::new(None),
                 clock,
             }),
         }
@@ -158,7 +164,9 @@ impl RelayState {
             event_id: event_id.clone(),
             broadcaster_token: token,
             metadata_url: format!("/v1/liveitems/{event_id}/metadata"),
+            remote_value_url: format!("/v1/liveitems/{event_id}/remoteValue"),
             events_url: format!("/v1/liveitems/{event_id}/events"),
+            socket_io_url: format!("/event?event_id={event_id}"),
         })
     }
 
@@ -201,8 +209,10 @@ impl RelayState {
             inner.replay.pop_front();
         }
 
+        let metadata = snapshot.metadata.clone();
         drop(inner);
         let _ = event.sender.send(snapshot);
+        self.emit_socket_remote_value(event_id, &metadata).await;
 
         Ok(PublishMetadataResponse {
             event_id: event_id.to_string(),
@@ -287,6 +297,32 @@ impl RelayState {
                 .unwrap_or(true)
         });
         before - events.len()
+    }
+
+    fn attach_socket_io(&self, io: SocketIo) {
+        *self
+            .inner
+            .socket_io
+            .write()
+            .expect("socket_io lock poisoned") = Some(io);
+    }
+
+    async fn emit_socket_remote_value(&self, event_id: &str, metadata: &Value) {
+        let io = self
+            .inner
+            .socket_io
+            .read()
+            .expect("socket_io lock poisoned")
+            .clone();
+        if let Some(io) = io
+            && let Some(event_ns) = io.of("/event")
+            && let Err(err) = event_ns
+                .to(event_id.to_string())
+                .emit("remoteValue", metadata)
+                .await
+        {
+            tracing::warn!(%event_id, ?err, "failed to emit Socket.IO remoteValue");
+        }
     }
 }
 
@@ -382,7 +418,9 @@ pub struct CreateEventResponse {
     pub event_id: String,
     pub broadcaster_token: String,
     pub metadata_url: String,
+    pub remote_value_url: String,
     pub events_url: String,
+    pub socket_io_url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -433,6 +471,11 @@ impl IntoResponse for ApiError {
 }
 
 pub fn app(state: RelayState) -> Router {
+    let (socket_layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
+
+    register_socket_namespaces(io.clone());
+    state.attach_socket_io(io);
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/liveitems/health", get(health))
@@ -446,6 +489,7 @@ pub fn app(state: RelayState) -> Router {
         .route("/v1/liveitems/{event_id}/events", get(events))
         .layer(RequestBodyLimitLayer::new(METADATA_BODY_LIMIT_BYTES))
         .with_state(state)
+        .layer(socket_layer)
 }
 
 pub fn spawn_cleanup_task(state: RelayState) -> tokio::task::JoinHandle<()> {
@@ -469,13 +513,13 @@ async fn health() -> &'static str {
 }
 
 async fn create_event(
-    State(state): State<RelayState>,
+    AxumState(state): AxumState<RelayState>,
 ) -> Result<Json<CreateEventResponse>, ApiError> {
     Ok(Json(state.create_event().await?))
 }
 
 async fn publish_metadata(
-    State(state): State<RelayState>,
+    AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<PublishMetadataRequest>,
@@ -485,21 +529,21 @@ async fn publish_metadata(
 }
 
 async fn latest_metadata(
-    State(state): State<RelayState>,
+    AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
 ) -> Result<Json<LatestMetadataResponse>, ApiError> {
     Ok(Json(state.latest_metadata(&event_id).await?))
 }
 
 async fn remote_value(
-    State(state): State<RelayState>,
+    AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.latest_metadata(&event_id).await?.metadata))
 }
 
 async fn events(
-    State(state): State<RelayState>,
+    AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
@@ -532,6 +576,50 @@ async fn events(
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn register_socket_namespaces(io: SocketIo) {
+    io.ns(
+        "/event",
+        async |socket: SocketRef, SocketState(state): SocketState<RelayState>| {
+            let Some(event_id) = socket_event_id(&socket) else {
+                let _ = socket.emit("remoteValue", &json!({}));
+                socket.disconnect().ok();
+                return;
+            };
+
+            let event = match state.get_event(&event_id).await {
+                Ok(event) => event,
+                Err(_) => {
+                    let _ = socket.emit("remoteValue", &json!({}));
+                    socket.disconnect().ok();
+                    return;
+                }
+            };
+
+            socket.join(event_id.clone());
+
+            let current = event
+                .inner
+                .read()
+                .await
+                .latest
+                .as_ref()
+                .map(|snapshot| snapshot.metadata.clone())
+                .unwrap_or_else(|| json!({}));
+
+            if let Err(err) = socket.emit("remoteValue", &current) {
+                tracing::warn!(%event_id, ?err, "failed to emit initial Socket.IO remoteValue");
+            }
+        },
+    );
+}
+
+fn socket_event_id(socket: &SocketRef) -> Option<String> {
+    socket.req_parts().uri.query()?.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == "event_id" && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn snapshot_to_sse_remote_value(snapshot: MetadataSnapshot) -> Event {
@@ -631,7 +719,9 @@ mod tests {
         assert_ne!(first.event_id, second.event_id);
         assert_ne!(first.broadcaster_token, second.broadcaster_token);
         assert!(first.metadata_url.ends_with("/metadata"));
+        assert!(first.remote_value_url.ends_with("/remoteValue"));
         assert!(first.events_url.ends_with("/events"));
+        assert!(first.socket_io_url.starts_with("/event?event_id="));
     }
 
     #[tokio::test]

@@ -3,8 +3,8 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        Arc, RwLock as StdRwLock,
-        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -118,7 +118,7 @@ struct RelayStateInner {
     config: AppConfig,
     events: RwLock<HashMap<String, Arc<LiveEventState>>>,
     sse_connections: AtomicUsize,
-    socket_io: StdRwLock<Option<SocketIo>>,
+    socket_io: OnceLock<SocketIo>,
     clock: Clock,
 }
 
@@ -135,7 +135,7 @@ impl RelayState {
                 config,
                 events: RwLock::new(HashMap::new()),
                 sse_connections: AtomicUsize::new(0),
-                socket_io: StdRwLock::new(None),
+                socket_io: OnceLock::new(),
                 clock,
             }),
         }
@@ -192,14 +192,17 @@ impl RelayState {
         }
         let metadata = body.into_metadata(event_id)?;
 
+        let now = self.now();
+        event.touch(now);
+
         let mut inner = event.inner.write().await;
         inner.seq += 1;
-        inner.last_activity = self.now();
+        let seq = inner.seq;
 
         let snapshot = MetadataSnapshot {
             event_id: event_id.to_string(),
-            seq: inner.seq,
-            updated_at: format_timestamp(inner.last_activity),
+            seq,
+            updated_at: format_timestamp(now),
             metadata,
         };
 
@@ -217,7 +220,7 @@ impl RelayState {
         Ok(PublishMetadataResponse {
             event_id: event_id.to_string(),
             accepted: true,
-            seq: event.current_seq().await,
+            seq,
         })
     }
 
@@ -262,9 +265,9 @@ impl RelayState {
             }
         };
 
+        event.touch(self.now());
         let replay = {
-            let mut inner = event.inner.write().await;
-            inner.last_activity = self.now();
+            let inner = event.inner.read().await;
             match last_event_id {
                 Some(last_event_id) => inner
                     .replay
@@ -289,32 +292,19 @@ impl RelayState {
         let cutoff = self.now().saturating_sub(self.inner.config.ttl.as_secs());
         let mut events = self.inner.events.write().await;
         let before = events.len();
-        events.retain(|_, event| {
-            event
-                .inner
-                .try_read()
-                .map(|inner| inner.last_activity >= cutoff)
-                .unwrap_or(true)
-        });
+        events.retain(|_, event| event.last_activity.load(Ordering::Relaxed) >= cutoff);
         before - events.len()
     }
 
     fn attach_socket_io(&self, io: SocketIo) {
-        *self
-            .inner
+        self.inner
             .socket_io
-            .write()
-            .expect("socket_io lock poisoned") = Some(io);
+            .set(io)
+            .expect("socket_io already attached; app(state) called twice on same RelayState");
     }
 
     async fn emit_socket_remote_value(&self, event_id: &str, metadata: &Value) {
-        let io = self
-            .inner
-            .socket_io
-            .read()
-            .expect("socket_io lock poisoned")
-            .clone();
-        if let Some(io) = io
+        if let Some(io) = self.inner.socket_io.get()
             && let Some(event_ns) = io.of("/event")
             && let Err(err) = event_ns
                 .to(event_id.to_string())
@@ -337,6 +327,7 @@ fn unique_event_id(events: &HashMap<String, Arc<LiveEventState>>) -> String {
 
 struct LiveEventState {
     token_hash: [u8; 32],
+    last_activity: AtomicU64,
     inner: RwLock<LiveEventInner>,
     sender: broadcast::Sender<MetadataSnapshot>,
 }
@@ -345,7 +336,6 @@ struct LiveEventInner {
     seq: u64,
     latest: Option<MetadataSnapshot>,
     replay: VecDeque<MetadataSnapshot>,
-    last_activity: u64,
 }
 
 impl LiveEventState {
@@ -353,11 +343,11 @@ impl LiveEventState {
         let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             token_hash,
+            last_activity: AtomicU64::new(now),
             inner: RwLock::new(LiveEventInner {
                 seq: 0,
                 latest: None,
                 replay: VecDeque::with_capacity(REPLAY_CAPACITY),
-                last_activity: now,
             }),
             sender,
         }
@@ -371,8 +361,8 @@ impl LiveEventState {
             .into()
     }
 
-    async fn current_seq(&self) -> u64 {
-        self.inner.read().await.seq
+    fn touch(&self, now: u64) {
+        self.last_activity.store(now, Ordering::Relaxed);
     }
 }
 
@@ -393,23 +383,31 @@ impl Drop for EventSubscription {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum PublishMetadataRequest {
-    Wrapped { event_id: String, metadata: Value },
-    Direct(Value),
-}
+#[serde(transparent)]
+pub struct PublishMetadataRequest(Value);
 
 impl PublishMetadataRequest {
     fn into_metadata(self, path_event_id: &str) -> Result<Value, ApiError> {
-        match self {
-            Self::Wrapped { event_id, metadata } => {
-                if event_id != path_event_id {
-                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "event_id_mismatch"));
-                }
-                Ok(metadata)
+        if let Some(map) = self.0.as_object()
+            && map.len() == 2
+            && map.contains_key("event_id")
+            && map.contains_key("metadata")
+        {
+            let event_id = map
+                .get("event_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_event_id"))?;
+            if event_id != path_event_id {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "event_id_mismatch"));
             }
-            Self::Direct(metadata) => Ok(metadata),
+            let mut owned = self.0;
+            let metadata = owned
+                .as_object_mut()
+                .and_then(|m| m.remove("metadata"))
+                .expect("metadata key present");
+            return Ok(metadata);
         }
+        Ok(self.0)
     }
 }
 
@@ -564,9 +562,7 @@ async fn events(
         loop {
             match subscription.receiver.recv().await {
                 Ok(snapshot) => {
-                    if let Ok(mut inner) = subscription.event.inner.try_write() {
-                        inner.last_activity = subscription.state.now();
-                    }
+                    subscription.event.touch(subscription.state.now());
                     yield Ok(snapshot_to_sse_remote_value(snapshot));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -733,10 +729,10 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
-                PublishMetadataRequest::Wrapped {
-                    event_id: created.event_id.clone(),
-                    metadata: json!({"title": "First"}),
-                },
+                PublishMetadataRequest(json!({
+                    "event_id": created.event_id.clone(),
+                    "metadata": {"title": "First"},
+                })),
             )
             .await
             .expect("valid token publishes");
@@ -745,10 +741,10 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 "wrong",
-                PublishMetadataRequest::Wrapped {
-                    event_id: created.event_id.clone(),
-                    metadata: json!({"title": "Second"}),
-                },
+                PublishMetadataRequest(json!({
+                    "event_id": created.event_id.clone(),
+                    "metadata": {"title": "Second"},
+                })),
             )
             .await
             .expect_err("wrong token rejected");
@@ -763,10 +759,10 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
-                PublishMetadataRequest::Wrapped {
-                    event_id: "different".to_string(),
-                    metadata: json!({}),
-                },
+                PublishMetadataRequest(json!({
+                    "event_id": "different",
+                    "metadata": {},
+                })),
             )
             .await
             .expect_err("mismatch rejected");
@@ -784,10 +780,10 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
-                    PublishMetadataRequest::Wrapped {
-                        event_id: created.event_id.clone(),
-                        metadata: json!({"title": title}),
-                    },
+                    PublishMetadataRequest(json!({
+                        "event_id": created.event_id.clone(),
+                        "metadata": {"title": title},
+                    })),
                 )
                 .await
                 .expect("publish");
@@ -811,10 +807,10 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
-                    PublishMetadataRequest::Wrapped {
-                        event_id: created.event_id.clone(),
-                        metadata: json!({"index": index}),
-                    },
+                    PublishMetadataRequest(json!({
+                        "event_id": created.event_id.clone(),
+                        "metadata": {"index": index},
+                    })),
                 )
                 .await
                 .expect("publish");
@@ -825,6 +821,52 @@ mod tests {
         assert_eq!(inner.replay.len(), REPLAY_CAPACITY);
         assert_eq!(inner.replay.front().expect("front").seq, 6);
         assert_eq!(inner.replay.back().expect("back").seq, 105);
+    }
+
+    #[tokio::test]
+    async fn subscribe_touches_last_activity_so_event_is_not_evicted() {
+        let (state, clock) = test_state(100);
+        let created = state.create_event().await.expect("create event");
+
+        clock.store(108, Ordering::SeqCst);
+        let _subscription = state
+            .subscribe(&created.event_id, None)
+            .await
+            .expect("subscribe");
+
+        clock.store(115, Ordering::SeqCst); // cutoff = 105; touched at 108 → kept
+        assert_eq!(state.cleanup_expired().await, 0);
+        state
+            .get_event(&created.event_id)
+            .await
+            .expect("event still present");
+    }
+
+    #[tokio::test]
+    async fn direct_payload_with_event_id_and_metadata_keys_is_treated_as_direct() {
+        let (state, _) = test_state(1);
+        let created = state.create_event().await.expect("create event");
+
+        let payload = json!({
+            "event_id": "different-from-path",
+            "metadata": {"x": 1},
+            "extra": "field",
+        });
+
+        state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(payload.clone()),
+            )
+            .await
+            .expect("direct payload accepted");
+
+        let latest = state
+            .latest_metadata(&created.event_id)
+            .await
+            .expect("latest");
+        assert_eq!(latest.metadata, payload);
     }
 
     #[tokio::test]

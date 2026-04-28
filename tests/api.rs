@@ -194,6 +194,42 @@ async fn direct_remote_value_publish_is_accepted_and_returned_raw() {
 }
 
 #[tokio::test]
+async fn direct_payload_with_event_id_and_metadata_keys_is_not_misparsed_as_wrapped() {
+    let router = test_app();
+    let created = create_event(router.clone()).await;
+
+    // payload happens to have event_id + metadata keys plus extras → must be Direct
+    let raw = json!({
+        "event_id": "different-from-path",
+        "metadata": {"foo": "bar"},
+        "title": "Live show",
+    });
+
+    let response = publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        raw.clone(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/liveitems/{}/remoteValue", created.event_id))
+                .body(Body::empty())
+                .expect("remoteValue request"),
+        )
+        .await
+        .expect("remoteValue response");
+
+    let body: Value = read_json(response).await;
+    assert_eq!(body, raw);
+}
+
+#[tokio::test]
 async fn create_accepts_trailing_slash() {
     let created = create_event_at(test_app(), "/v1/liveitems/").await;
 

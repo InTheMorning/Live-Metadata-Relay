@@ -107,6 +107,12 @@ Status codes:
 - `401` when the bearer token is missing or malformed.
 - `403` when the bearer token is wrong.
 - `404` when the event does not exist.
+- `413` when the request body exceeds 64 KiB.
+- `429` when per-event publish rate limit is exceeded.
+
+The `Bearer` scheme is matched case-insensitively (`bearer`, `BEARER`, etc.).
+
+The relay distinguishes the wrapped form from the direct form by exact key match: a request body is treated as wrapped only when the JSON object has exactly the two keys `event_id` and `metadata`. Any object with additional keys (or different keys) is treated as a direct live value payload.
 
 ### Read Latest Metadata
 
@@ -134,6 +140,8 @@ The Socket.IO-compatible raw payload is also available at:
 ```http
 GET /v1/liveitems/{event_id}/remoteValue
 ```
+
+When the event exists but no metadata has been published yet, this endpoint returns `200 OK` with `{}` (mirrors Socket.IO's initial-emit behavior). It returns `404` only when the event itself does not exist.
 
 ### Subscribe With Socket.IO
 
@@ -360,8 +368,14 @@ Configuration is read from environment variables.
 | `MAX_ACTIVE_EVENTS` | `10000` | Maximum number of live items kept in memory. |
 | `MAX_SSE_CONNECTIONS` | `1000` | Maximum concurrent SSE streams. |
 | `EVENT_TTL_SECS` | `86400` | Time before inactive events expire. |
+| `MAX_CREATES_PER_SEC` | `50` | Global cap on `POST /v1/liveitems` per second. Returns 429 when exceeded. |
+| `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Returns 429 when exceeded. |
 
-Metadata request bodies are limited to 64 KiB.
+Metadata request bodies are limited to 64 KiB. The body limit applies only to `POST /v1/liveitems/{event_id}/metadata`; other routes are unconstrained.
+
+Per-IP rate limiting is the responsibility of the front-end proxy (e.g. nginx). The relay's `MAX_CREATES_PER_SEC` is a global safety bound, not a per-client limit.
+
+CORS is enabled with a permissive policy (any origin, method, and header) so browser-side podcast apps can consume the SSE and HTTP fallback endpoints directly. Lock this down at the proxy if you need stricter origin policy.
 
 ## Run
 

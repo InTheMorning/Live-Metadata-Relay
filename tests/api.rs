@@ -324,6 +324,62 @@ async fn publish_with_wrong_token_returns_403() {
 }
 
 #[tokio::test]
+async fn remote_value_returns_empty_object_before_first_publish() {
+    let router = test_app();
+    let created = create_event(router.clone()).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/liveitems/{}/remoteValue", created.event_id))
+                .body(Body::empty())
+                .expect("remoteValue request"),
+        )
+        .await
+        .expect("remoteValue response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = read_json(response).await;
+    assert_eq!(body, json!({}));
+}
+
+#[tokio::test]
+async fn publish_body_over_limit_returns_413() {
+    let router = test_app();
+    let created = create_event(router.clone()).await;
+
+    // Build >64 KiB payload.
+    let mut big = String::with_capacity(70 * 1024);
+    big.push('"');
+    for _ in 0..(70 * 1024) {
+        big.push('a');
+    }
+    big.push('"');
+    let body = format!(
+        r#"{{"event_id":"{}","metadata":{{"x":{}}}}}"#,
+        created.event_id, big
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", created.broadcaster_token),
+                )
+                .body(Body::from(body))
+                .expect("oversized request"),
+        )
+        .await
+        .expect("oversized response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn unknown_event_id_returns_404() {
     let response = test_app()
         .oneshot(

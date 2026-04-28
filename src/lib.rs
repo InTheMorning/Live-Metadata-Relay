@@ -545,11 +545,12 @@ pub fn app(state: RelayState) -> Router {
         .route("/v1/liveitems/", post(create_event))
         .route(
             "/v1/liveitems/{event_id}/metadata",
-            get(latest_metadata).post(publish_metadata),
+            get(latest_metadata)
+                .post(publish_metadata)
+                .route_layer(RequestBodyLimitLayer::new(METADATA_BODY_LIMIT_BYTES)),
         )
         .route("/v1/liveitems/{event_id}/remoteValue", get(remote_value))
         .route("/v1/liveitems/{event_id}/events", get(events))
-        .layer(RequestBodyLimitLayer::new(METADATA_BODY_LIMIT_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(state)
         .layer(socket_layer)
@@ -602,7 +603,16 @@ async fn remote_value(
     AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(state.latest_metadata(&event_id).await?.metadata))
+    let event = state.get_event(&event_id).await?;
+    let metadata = event
+        .inner
+        .read()
+        .await
+        .latest
+        .as_ref()
+        .map(|snapshot| snapshot.metadata.clone())
+        .unwrap_or_else(|| json!({}));
+    Ok(Json(metadata))
 }
 
 async fn events(
@@ -993,6 +1003,61 @@ mod tests {
 
         clock.store(2, Ordering::SeqCst);
         state.create_event().await.expect("next-window create");
+    }
+
+    #[tokio::test]
+    async fn max_active_events_returns_503_when_full() {
+        let clock = Arc::new(AtomicU64::new(1));
+        let state = RelayState::with_clock(
+            AppConfig {
+                max_active_events: 2,
+                ..AppConfig::for_tests()
+            },
+            {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+        );
+        state.create_event().await.expect("first");
+        state.create_event().await.expect("second");
+        let err = state.create_event().await.expect_err("third");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "max_active_events_reached");
+    }
+
+    #[tokio::test]
+    async fn max_sse_connections_enforced_and_decrements_on_drop() {
+        let clock = Arc::new(AtomicU64::new(1));
+        let state = RelayState::with_clock(
+            AppConfig {
+                max_sse_connections: 1,
+                ..AppConfig::for_tests()
+            },
+            {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+        );
+        let created = state.create_event().await.expect("create");
+
+        let sub = state
+            .subscribe(&created.event_id, None)
+            .await
+            .expect("first subscribe");
+
+        let err = match state.subscribe(&created.event_id, None).await {
+            Ok(_) => panic!("second subscribe should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "max_sse_connections_reached");
+
+        drop(sub);
+        state
+            .subscribe(&created.event_id, None)
+            .await
+            .map(|_| ())
+            .expect("post-drop subscribe");
     }
 
     #[tokio::test]

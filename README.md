@@ -114,6 +114,148 @@ When `Last-Event-ID` is present and valid, the relay replays buffered events wit
 
 The stream also sends periodic keepalive comments.
 
+## RSS `podcast:liveValue`
+
+The relay is intended to be advertised from a Podcasting 2.0 live item with an
+experimental `podcast:liveValue` tag. This follows the same idea as The Split
+Kit's live value work: the RSS feed tells podcast apps which live metadata
+transport to use and where to connect, then the live server sends the current
+chapter/value block while the stream is playing.
+
+For this relay, the recommended RSS shape is:
+
+```xml
+<podcast:liveItem
+    status="live"
+    start="2026-04-28T00:00:00Z"
+    end="2026-04-28T03:00:00Z">
+
+  <title>My Live Music Show</title>
+  <guid isPermaLink="false">my-show-live-2026-04-28</guid>
+
+  <enclosure
+      url="https://stream.example.com/live.mp3"
+      type="audio/mpeg"
+      length="1" />
+
+  <podcast:contentLink href="https://example.com/live">
+    Listen live
+  </podcast:contentLink>
+
+  <podcast:value type="lightning" method="keysend" suggested="0.00000015000">
+    <podcast:valueRecipient
+        name="Default show split"
+        type="node"
+        address="030000000000000000000000000000000000000000000000000000000000000000"
+        split="100" />
+  </podcast:value>
+
+  <podcast:liveValue
+      uri="https://api.musicindex.org/v1/liveitems/GCeSvW8qLdzSdXO9rrlKGg"
+      protocol="sse" />
+</podcast:liveItem>
+```
+
+Only the public event URI belongs in RSS. The broadcaster token returned by
+`POST /v1/liveitems` is a write credential and must remain private.
+
+### Why `protocol="sse"`
+
+The `protocol` attribute should describe the client transport an app needs, not
+the brand or implementation of the relay. The Split Kit-style tag uses a
+protocol value such as `socket.io` or `socket-io` to tell apps to open a
+Socket.IO client. This relay uses standard Server-Sent Events, so `sse` is the
+clean equivalent.
+
+Avoid values such as `musicindex-live-relay` in RSS. They force apps to special
+case one service even though the transport is ordinary SSE. A generic
+`protocol="sse"` lets other hosts run compatible relays as long as they expose
+the same event URI shape.
+
+### Event URI Convention
+
+Use the base live item URI in the tag:
+
+```xml
+<podcast:liveValue
+    uri="https://api.musicindex.org/v1/liveitems/<event_id>"
+    protocol="sse" />
+```
+
+Apps derive the two public read endpoints from that base URI:
+
+```text
+GET <uri>/metadata  current snapshot
+GET <uri>/events    SSE stream
+```
+
+The snapshot endpoint matters because podcast apps may start playback in the
+middle of a live show, reconnect after losing network, or run in a mobile
+background mode where a persistent SSE connection is not reliable. Apps should
+read `/metadata` when playback starts, then subscribe to `/events` while they
+can keep a live connection open. If the stream disconnects, the app can reconnect
+with `Last-Event-ID` or poll `/metadata` as a conservative fallback.
+
+The direct SSE URL form is also possible:
+
+```xml
+<podcast:liveValue
+    uri="https://api.musicindex.org/v1/liveitems/<event_id>/events"
+    protocol="sse" />
+```
+
+The base URI form is preferred because it gives apps both the current snapshot
+and event stream without inventing extra attributes.
+
+### Metadata Payload
+
+Published metadata should be treated as a live chapter plus a replacement value
+block. It has the same role as a `podcast:valueTimeSplit` in a recorded show,
+except the active block changes in real time instead of being known ahead of
+time.
+
+Recommended payload shape:
+
+```json
+{
+  "title": "Song Title",
+  "author": "Artist Name",
+  "podcastName": "Album or Show Name",
+  "image": "https://example.com/art.jpg",
+  "link": {
+    "text": "Open track",
+    "url": "https://example.com/track"
+  },
+  "value": {
+    "type": "lightning",
+    "method": "keysend",
+    "destinations": [
+      {
+        "name": "Artist",
+        "address": "020000000000000000000000000000000000000000000000000000000000000000",
+        "customKey": "696969",
+        "customValue": "artist-custom-value",
+        "split": "95",
+        "fee": "false"
+      },
+      {
+        "name": "Show",
+        "address": "030000000000000000000000000000000000000000000000000000000000000000",
+        "split": "5",
+        "fee": "true"
+      }
+    ]
+  },
+  "feedGuid": "optional-feed-guid",
+  "itemGuid": "optional-item-guid"
+}
+```
+
+When this payload is active, supporting apps should use `metadata.value` as the
+current payment split. The static `<podcast:value>` inside the live item remains
+the fallback/default split for apps that do not support `podcast:liveValue`, for
+periods before the first live update, and for reconnect failures.
+
 ### Health
 
 ```http
@@ -125,6 +267,8 @@ Returns:
 ```text
 ok
 ```
+
+`GET /v1/liveitems/health` returns the same response and is useful for checking that nginx is reaching the live relay specifically. On `api.musicindex.org`, the top-level `/health` route may belong to another API service.
 
 ## Configuration
 
@@ -203,3 +347,22 @@ location ^~ /v1/liveitems/ {
 ```
 
 The `proxy_pass` target intentionally has no trailing slash so nginx preserves `/v1/liveitems/...` when forwarding to the relay.
+
+If nginx returns `502 Bad Gateway` for `/v1/liveitems`, nginx is matching the route but cannot reach the relay on `127.0.0.1:8018`. Check the service on the host:
+
+```sh
+sudo systemctl status musicindex-live-relay --no-pager
+sudo journalctl -u musicindex-live-relay -n 100 --no-pager
+ss -ltnp | grep 8018
+curl -i http://127.0.0.1:8018/health
+curl -i -X POST http://127.0.0.1:8018/v1/liveitems
+```
+
+After the relay is listening locally, reload nginx and verify the proxied health route:
+
+```sh
+sudo nginx -t
+sudo systemctl reload nginx
+curl -i https://api.musicindex.org/v1/liveitems/health
+curl -i -X POST https://api.musicindex.org/v1/liveitems
+```

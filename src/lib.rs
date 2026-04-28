@@ -423,6 +423,7 @@ impl IntoResponse for ApiError {
 pub fn app(state: RelayState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/liveitems/health", get(health))
         .route("/v1/liveitems", post(create_event))
         .route("/v1/liveitems/", post(create_event))
         .route(

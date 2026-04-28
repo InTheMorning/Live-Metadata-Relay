@@ -195,21 +195,23 @@ async fn unknown_event_id_returns_404() {
 
 #[tokio::test]
 async fn health_returns_ok() {
-    let response = test_app()
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .expect("health request"),
-        )
-        .await
-        .expect("health response");
+    for uri in ["/health", "/v1/liveitems/health"] {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    assert_eq!(&bytes[..], b"ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(&bytes[..], b"ok");
+    }
 }
 
 #[tokio::test]

@@ -133,6 +133,64 @@ async fn create_publish_and_fetch_latest_snapshot() {
 }
 
 #[tokio::test]
+async fn direct_remote_value_publish_is_accepted_and_returned_raw() {
+    let router = test_app();
+    let created = create_event(router.clone()).await;
+    let remote_value = json!({
+        "title": "This is the title for this block.",
+        "image": "https://example.com/art.png",
+        "line": ["this is line 1", "this is line 2"],
+        "link": {
+            "text": "This is the text for the link",
+            "url": "https://podcastindex.social"
+        },
+        "description": "this would be an area for something like show notes",
+        "value": {
+            "model": {
+                "type": "lightning",
+                "method": "keysend"
+            },
+            "destinations": [
+                {
+                    "name": "The Split Kit",
+                    "address": "030a58b8653d32b99200a2334cfe913e51dc7d155aa0116c176657a4f1722677a3",
+                    "customKey": "696969",
+                    "customValue": "boPNspwDdt7axih5DfKs",
+                    "split": "5",
+                    "fee": "false"
+                }
+            ]
+        },
+        "type": "person",
+        "feedGuid": "optional-feed-guid",
+        "itemGuid": "optional-item-guid"
+    });
+
+    let response = publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        remote_value.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/liveitems/{}/remoteValue", created.event_id))
+                .body(Body::empty())
+                .expect("remoteValue request"),
+        )
+        .await
+        .expect("remoteValue response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = read_json(response).await;
+    assert_eq!(body, remote_value);
+}
+
+#[tokio::test]
 async fn create_accepts_trailing_slash() {
     let created = create_event_at(test_app(), "/v1/liveitems/").await;
 
@@ -215,7 +273,7 @@ async fn health_returns_ok() {
 }
 
 #[tokio::test]
-async fn sse_stream_receives_live_metadata_event() {
+async fn sse_stream_receives_socket_io_compatible_remote_value_event() {
     let router = test_app();
     let created = create_event(router.clone()).await;
 
@@ -246,9 +304,10 @@ async fn sse_stream_receives_live_metadata_event() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let chunk = next_sse_chunk(&mut body).await;
-    assert!(chunk.contains("event: metadata"), "{chunk}");
+    assert!(chunk.contains("event: remoteValue"), "{chunk}");
     assert!(chunk.contains("id: 1"), "{chunk}");
     assert!(chunk.contains("\"title\":\"Live\""), "{chunk}");
+    assert!(!chunk.contains("\"metadata\""), "{chunk}");
 }
 
 #[tokio::test]

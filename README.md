@@ -55,7 +55,34 @@ Request body:
 }
 ```
 
-The path `event_id` and body `event_id` must match. On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, and broadcasts an SSE `metadata` event.
+This wrapped request body is what the v4vmm client sends. The path `event_id` and body `event_id` must match.
+
+For compatibility with the widely used Socket.IO live value implementation, the relay also accepts the live value payload directly:
+
+```json
+{
+  "title": "This is the title for this block.",
+  "image": "https://example.com/art.png",
+  "line": ["this is line 1", "this is line 2"],
+  "link": {
+    "text": "This is the text for the link",
+    "url": "https://podcastindex.social"
+  },
+  "description": "this would be an area for something like show notes",
+  "value": {
+    "model": {
+      "type": "lightning",
+      "method": "keysend"
+    },
+    "destinations": []
+  },
+  "type": "person",
+  "feedGuid": "optional-feed-guid",
+  "itemGuid": "optional-item-guid"
+}
+```
+
+On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, and broadcasts an SSE `remoteValue` event whose JSON data is the raw live value payload.
 
 Response:
 
@@ -95,6 +122,12 @@ Response:
 
 Returns `404` when the event does not exist or no metadata has been published yet.
 
+The Socket.IO-compatible raw payload is also available at:
+
+```http
+GET /v1/liveitems/{event_id}/remoteValue
+```
+
 ### Subscribe To Metadata Events
 
 ```http
@@ -102,12 +135,12 @@ GET /v1/liveitems/{event_id}/events
 Accept: text/event-stream
 ```
 
-The SSE stream is public. Each metadata update is emitted as:
+The SSE stream is public. Each metadata update is emitted with the same event name and data shape used by the Socket.IO live value implementation:
 
 ```text
-event: metadata
+event: remoteValue
 id: <seq>
-data: {"event_id":"...","seq":1,"updated_at":"...","metadata":{}}
+data: {"title":"...","image":"...","line":["..."],"value":{...},"type":"person"}
 ```
 
 When `Last-Event-ID` is present and valid, the relay replays buffered events with `seq > Last-Event-ID` before streaming live updates. The replay buffer keeps the last 100 metadata updates per live item.
@@ -157,20 +190,10 @@ For this relay, the recommended RSS shape is:
 ```
 
 Only the public event URI belongs in RSS. The broadcaster token returned by
-`POST /v1/liveitems` is a write credential and must remain private.
-
-### Why `protocol="sse"`
-
-The `protocol` attribute should describe the client transport an app needs, not
-the brand or implementation of the relay. The Split Kit-style tag uses a
-protocol value such as `socket.io` or `socket-io` to tell apps to open a
-Socket.IO client. This relay uses standard Server-Sent Events, so `sse` is the
-clean equivalent.
-
-Avoid values such as `musicindex-live-relay` in RSS. They force apps to special
-case one service even though the transport is ordinary SSE. A generic
-`protocol="sse"` lets other hosts run compatible relays as long as they expose
-the same event URI shape.
+`POST /v1/liveitems` is a write credential and must remain private. The relay
+uses SSE as the transport, but the event name and payload intentionally mirror
+the current Socket.IO `remoteValue` convention so app-side value handling can be
+shared.
 
 ### Event URI Convention
 
@@ -185,8 +208,9 @@ Use the base live item URI in the tag:
 Apps derive the two public read endpoints from that base URI:
 
 ```text
-GET <uri>/metadata  current snapshot
-GET <uri>/events    SSE stream
+GET <uri>/metadata     wrapped current snapshot
+GET <uri>/remoteValue  raw current remoteValue payload
+GET <uri>/events       SSE stream of remoteValue events
 ```
 
 The snapshot endpoint matters because podcast apps may start playback in the
@@ -207,51 +231,53 @@ The direct SSE URL form is also possible:
 The base URI form is preferred because it gives apps both the current snapshot
 and event stream without inventing extra attributes.
 
-### Metadata Payload
+### `remoteValue` Payload
 
-Published metadata should be treated as a live chapter plus a replacement value
-block. It has the same role as a `podcast:valueTimeSplit` in a recorded show,
-except the active block changes in real time instead of being known ahead of
-time.
+Published metadata should use the same shape as the Socket.IO `remoteValue`
+payload. It acts as a live chapter plus a replacement value block, similar to a
+`podcast:valueTimeSplit` in a recorded show, except the active block changes in
+real time instead of being known ahead of time.
 
 Recommended payload shape:
 
 ```json
 {
-  "title": "Song Title",
-  "author": "Artist Name",
-  "podcastName": "Album or Show Name",
-  "image": "https://example.com/art.jpg",
+  "title": "This is the title for this block.",
+  "image": "https://example.com/art.png",
+  "line": [
+    "this is line 1",
+    "this is line 2",
+    "this is line 3",
+    "this is line 4"
+  ],
   "link": {
-    "text": "Open track",
-    "url": "https://example.com/track"
+    "text": "This is the text for the link",
+    "url": "https://podcastindex.social"
   },
+  "description": "this would be an area for something like show notes",
   "value": {
-    "type": "lightning",
-    "method": "keysend",
+    "model": {
+      "type": "lightning",
+      "method": "keysend"
+    },
     "destinations": [
       {
-        "name": "Artist",
-        "address": "020000000000000000000000000000000000000000000000000000000000000000",
+        "name": "The Split Kit",
+        "address": "030a58b8653d32b99200a2334cfe913e51dc7d155aa0116c176657a4f1722677a3",
         "customKey": "696969",
-        "customValue": "artist-custom-value",
-        "split": "95",
-        "fee": "false"
-      },
-      {
-        "name": "Show",
-        "address": "030000000000000000000000000000000000000000000000000000000000000000",
+        "customValue": "boPNspwDdt7axih5DfKs",
         "split": "5",
-        "fee": "true"
+        "fee": "false"
       }
     ]
   },
+  "type": "person",
   "feedGuid": "optional-feed-guid",
   "itemGuid": "optional-item-guid"
 }
 ```
 
-When this payload is active, supporting apps should use `metadata.value` as the
+When this payload is active, supporting apps should use `value` as the
 current payment split. The static `<podcast:value>` inside the live item remains
 the fallback/default split for apps that do not support `podcast:liveValue`, for
 periods before the first live update, and for reconnect failures.

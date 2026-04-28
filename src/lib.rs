@@ -178,14 +178,11 @@ impl RelayState {
         token: &str,
         body: PublishMetadataRequest,
     ) -> Result<PublishMetadataResponse, ApiError> {
-        if body.event_id != event_id {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "event_id_mismatch"));
-        }
-
         let event = self.get_event(event_id).await?;
         if !event.token_matches(token) {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
         }
+        let metadata = body.into_metadata(event_id)?;
 
         let mut inner = event.inner.write().await;
         inner.seq += 1;
@@ -195,7 +192,7 @@ impl RelayState {
             event_id: event_id.to_string(),
             seq: inner.seq,
             updated_at: format_timestamp(inner.last_activity),
-            metadata: body.metadata,
+            metadata,
         };
 
         inner.latest = Some(snapshot.clone());
@@ -360,9 +357,24 @@ impl Drop for EventSubscription {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PublishMetadataRequest {
-    pub event_id: String,
-    pub metadata: Value,
+#[serde(untagged)]
+pub enum PublishMetadataRequest {
+    Wrapped { event_id: String, metadata: Value },
+    Direct(Value),
+}
+
+impl PublishMetadataRequest {
+    fn into_metadata(self, path_event_id: &str) -> Result<Value, ApiError> {
+        match self {
+            Self::Wrapped { event_id, metadata } => {
+                if event_id != path_event_id {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "event_id_mismatch"));
+                }
+                Ok(metadata)
+            }
+            Self::Direct(metadata) => Ok(metadata),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -430,6 +442,7 @@ pub fn app(state: RelayState) -> Router {
             "/v1/liveitems/{event_id}/metadata",
             get(latest_metadata).post(publish_metadata),
         )
+        .route("/v1/liveitems/{event_id}/remoteValue", get(remote_value))
         .route("/v1/liveitems/{event_id}/events", get(events))
         .layer(RequestBodyLimitLayer::new(METADATA_BODY_LIMIT_BYTES))
         .with_state(state)
@@ -478,6 +491,13 @@ async fn latest_metadata(
     Ok(Json(state.latest_metadata(&event_id).await?))
 }
 
+async fn remote_value(
+    State(state): State<RelayState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.latest_metadata(&event_id).await?.metadata))
+}
+
 async fn events(
     State(state): State<RelayState>,
     Path(event_id): Path<String>,
@@ -494,7 +514,7 @@ async fn events(
         let mut subscription = subscription;
 
         for snapshot in subscription.replay.drain(..) {
-            yield Ok(snapshot_to_sse(snapshot));
+            yield Ok(snapshot_to_sse_remote_value(snapshot));
         }
 
         loop {
@@ -503,7 +523,7 @@ async fn events(
                     if let Ok(mut inner) = subscription.event.inner.try_write() {
                         inner.last_activity = subscription.state.now();
                     }
-                    yield Ok(snapshot_to_sse(snapshot));
+                    yield Ok(snapshot_to_sse_remote_value(snapshot));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -514,12 +534,12 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-fn snapshot_to_sse(snapshot: MetadataSnapshot) -> Event {
+fn snapshot_to_sse_remote_value(snapshot: MetadataSnapshot) -> Event {
     Event::default()
-        .event("metadata")
+        .event("remoteValue")
         .id(snapshot.seq.to_string())
-        .json_data(snapshot)
-        .expect("metadata snapshots are serializable")
+        .json_data(snapshot.metadata)
+        .expect("metadata payloads are serializable")
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -623,7 +643,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
-                PublishMetadataRequest {
+                PublishMetadataRequest::Wrapped {
                     event_id: created.event_id.clone(),
                     metadata: json!({"title": "First"}),
                 },
@@ -635,7 +655,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 "wrong",
-                PublishMetadataRequest {
+                PublishMetadataRequest::Wrapped {
                     event_id: created.event_id.clone(),
                     metadata: json!({"title": "Second"}),
                 },
@@ -653,7 +673,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
-                PublishMetadataRequest {
+                PublishMetadataRequest::Wrapped {
                     event_id: "different".to_string(),
                     metadata: json!({}),
                 },
@@ -674,7 +694,7 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
-                    PublishMetadataRequest {
+                    PublishMetadataRequest::Wrapped {
                         event_id: created.event_id.clone(),
                         metadata: json!({"title": title}),
                     },
@@ -701,7 +721,7 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
-                    PublishMetadataRequest {
+                    PublishMetadataRequest::Wrapped {
                         event_id: created.event_id.clone(),
                         metadata: json!({"index": index}),
                     },

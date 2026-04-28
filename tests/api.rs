@@ -41,6 +41,22 @@ async fn create_event(router: axum::Router) -> CreateEventResponse {
     read_json(response).await
 }
 
+async fn create_event_at(router: axum::Router, uri: &str) -> CreateEventResponse {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("create response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    read_json(response).await
+}
+
 async fn publish(
     router: axum::Router,
     event_id: &str,
@@ -114,6 +130,14 @@ async fn create_publish_and_fetch_latest_snapshot() {
         latest.metadata,
         json!({"title": "Now Playing", "artist": "Relay Test"})
     );
+}
+
+#[tokio::test]
+async fn create_accepts_trailing_slash() {
+    let created = create_event_at(test_app(), "/v1/liveitems/").await;
+
+    assert!(!created.event_id.is_empty());
+    assert!(!created.broadcaster_token.is_empty());
 }
 
 #[tokio::test]

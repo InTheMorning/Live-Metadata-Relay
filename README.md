@@ -9,6 +9,7 @@ The service is intentionally memory-only for v1. Clients create a live item, rec
 By default the relay binds to `127.0.0.1:8018` and is intended to sit behind nginx at:
 
 ```text
+/v1/liveitems
 /v1/liveitems/*
 ```
 
@@ -22,7 +23,7 @@ All state is process-local. Restarting the process drops live items, broadcaster
 POST /v1/liveitems
 ```
 
-Creates a new live metadata event. This endpoint is public.
+Creates a new live metadata event. This endpoint is public. `POST /v1/liveitems/` is also accepted for trailing-slash tolerant clients and proxies.
 
 Response:
 
@@ -171,5 +172,34 @@ The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`
 
 The intended nginx routing is:
 
+- `/v1/liveitems` proxies to `127.0.0.1:8018`.
 - `/v1/liveitems/` proxies to `127.0.0.1:8018`.
 - Other API routes continue to the existing Stophammer service.
+
+Example nginx locations:
+
+```nginx
+location = /v1/liveitems {
+    proxy_pass http://127.0.0.1:8018;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location ^~ /v1/liveitems/ {
+    proxy_pass http://127.0.0.1:8018;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+```
+
+The `proxy_pass` target intentionally has no trailing slash so nginx preserves `/v1/liveitems/...` when forwarding to the relay.

@@ -424,6 +424,7 @@ pub fn app(state: RelayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/liveitems", post(create_event))
+        .route("/v1/liveitems/", post(create_event))
         .route(
             "/v1/liveitems/{event_id}/metadata",
             get(latest_metadata).post(publish_metadata),

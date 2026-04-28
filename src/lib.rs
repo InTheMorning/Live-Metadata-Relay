@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
 use axum::{
     Json, Router,
     extract::{Path, State as AxumState},
@@ -30,12 +32,14 @@ use socketioxide::{
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{RwLock, broadcast};
-use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8018";
 const DEFAULT_MAX_ACTIVE_EVENTS: usize = 10_000;
 const DEFAULT_MAX_SSE_CONNECTIONS: usize = 1_000;
 const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
+const DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC: u32 = 20;
+const DEFAULT_MAX_CREATES_PER_SEC: u32 = 50;
 const METADATA_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const REPLAY_CAPACITY: usize = 100;
 const BROADCAST_CAPACITY: usize = 128;
@@ -48,6 +52,8 @@ pub struct AppConfig {
     pub max_active_events: usize,
     pub max_sse_connections: usize,
     pub ttl: Duration,
+    pub max_publishes_per_event_per_sec: u32,
+    pub max_creates_per_sec: u32,
 }
 
 impl AppConfig {
@@ -57,6 +63,11 @@ impl AppConfig {
             max_active_events: env_parse("MAX_ACTIVE_EVENTS", DEFAULT_MAX_ACTIVE_EVENTS)?,
             max_sse_connections: env_parse("MAX_SSE_CONNECTIONS", DEFAULT_MAX_SSE_CONNECTIONS)?,
             ttl: Duration::from_secs(env_parse("EVENT_TTL_SECS", DEFAULT_TTL_SECS)?),
+            max_publishes_per_event_per_sec: env_parse(
+                "MAX_PUBLISHES_PER_EVENT_PER_SEC",
+                DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
+            )?,
+            max_creates_per_sec: env_parse("MAX_CREATES_PER_SEC", DEFAULT_MAX_CREATES_PER_SEC)?,
         })
     }
 
@@ -66,6 +77,8 @@ impl AppConfig {
             max_active_events: DEFAULT_MAX_ACTIVE_EVENTS,
             max_sse_connections: DEFAULT_MAX_SSE_CONNECTIONS,
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
+            max_publishes_per_event_per_sec: DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
+            max_creates_per_sec: DEFAULT_MAX_CREATES_PER_SEC,
         }
     }
 }
@@ -118,6 +131,7 @@ struct RelayStateInner {
     config: AppConfig,
     events: RwLock<HashMap<String, Arc<LiveEventState>>>,
     sse_connections: AtomicUsize,
+    create_window: AtomicU64,
     socket_io: OnceLock<SocketIo>,
     clock: Clock,
 }
@@ -135,6 +149,7 @@ impl RelayState {
                 config,
                 events: RwLock::new(HashMap::new()),
                 sse_connections: AtomicUsize::new(0),
+                create_window: AtomicU64::new(0),
                 socket_io: OnceLock::new(),
                 clock,
             }),
@@ -146,6 +161,17 @@ impl RelayState {
     }
 
     pub async fn create_event(&self) -> Result<CreateEventResponse, ApiError> {
+        if !try_acquire_window_slot(
+            &self.inner.create_window,
+            self.now(),
+            self.inner.config.max_creates_per_sec,
+        ) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "create_rate_limited",
+            ));
+        }
+
         let mut events = self.inner.events.write().await;
         if events.len() >= self.inner.config.max_active_events {
             return Err(ApiError::new(
@@ -193,6 +219,12 @@ impl RelayState {
         let metadata = body.into_metadata(event_id)?;
 
         let now = self.now();
+        if !event.try_acquire_publish_slot(now, self.inner.config.max_publishes_per_event_per_sec) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "publish_rate_limited",
+            ));
+        }
         event.touch(now);
 
         let mut inner = event.inner.write().await;
@@ -316,6 +348,32 @@ impl RelayState {
     }
 }
 
+fn try_acquire_window_slot(window: &AtomicU64, now: u64, limit: u32) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let now_window = now & 0xFFFF_FFFF;
+    loop {
+        let current = window.load(Ordering::Acquire);
+        let stored_window = current >> 32;
+        let count = (current & 0xFFFF_FFFF) as u32;
+        let new = if stored_window == now_window {
+            if count >= limit {
+                return false;
+            }
+            (now_window << 32) | u64::from(count + 1)
+        } else {
+            (now_window << 32) | 1
+        };
+        if window
+            .compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
 fn unique_event_id(events: &HashMap<String, Arc<LiveEventState>>) -> String {
     loop {
         let event_id = random_urlsafe(EVENT_ID_BYTES);
@@ -328,6 +386,7 @@ fn unique_event_id(events: &HashMap<String, Arc<LiveEventState>>) -> String {
 struct LiveEventState {
     token_hash: [u8; 32],
     last_activity: AtomicU64,
+    publish_window: AtomicU64,
     inner: RwLock<LiveEventInner>,
     sender: broadcast::Sender<MetadataSnapshot>,
 }
@@ -344,6 +403,7 @@ impl LiveEventState {
         Self {
             token_hash,
             last_activity: AtomicU64::new(now),
+            publish_window: AtomicU64::new(0),
             inner: RwLock::new(LiveEventInner {
                 seq: 0,
                 latest: None,
@@ -351,6 +411,10 @@ impl LiveEventState {
             }),
             sender,
         }
+    }
+
+    fn try_acquire_publish_slot(&self, now: u64, limit: u32) -> bool {
+        try_acquire_window_slot(&self.publish_window, now, limit)
     }
 
     fn token_matches(&self, token: &str) -> bool {
@@ -486,6 +550,7 @@ pub fn app(state: RelayState) -> Router {
         .route("/v1/liveitems/{event_id}/remoteValue", get(remote_value))
         .route("/v1/liveitems/{event_id}/events", get(events))
         .layer(RequestBodyLimitLayer::new(METADATA_BODY_LIMIT_BYTES))
+        .layer(CorsLayer::permissive())
         .with_state(state)
         .layer(socket_layer)
 }
@@ -633,10 +698,18 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
         .to_str()
         .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "invalid_authorization_header"))?;
 
-    value
-        .strip_prefix("Bearer ")
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid_bearer_token"))
+    let (scheme, token) = value
+        .split_once(' ')
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid_bearer_token"))?;
+
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_bearer_token",
+        ));
+    }
+
+    Ok(token)
 }
 
 fn hash_token(token: &str) -> [u8; 32] {
@@ -646,28 +719,7 @@ fn hash_token(token: &str) -> [u8; 32] {
 fn random_urlsafe(byte_count: usize) -> String {
     let mut bytes = vec![0; byte_count];
     rand::rng().fill_bytes(&mut bytes);
-    base64_urlsafe_no_pad(&bytes)
-}
-
-fn base64_urlsafe_no_pad(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        }
-    }
-    out
+    URL_SAFE_NO_PAD.encode(&bytes)
 }
 
 fn epoch_seconds() -> u64 {
@@ -697,6 +749,8 @@ mod tests {
                 max_active_events: DEFAULT_MAX_ACTIVE_EVENTS,
                 max_sse_connections: DEFAULT_MAX_SSE_CONNECTIONS,
                 ttl: Duration::from_secs(10),
+                max_publishes_per_event_per_sec: DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
+                max_creates_per_sec: DEFAULT_MAX_CREATES_PER_SEC,
             },
             {
                 let clock = clock.clone();
@@ -799,10 +853,12 @@ mod tests {
 
     #[tokio::test]
     async fn replay_buffer_is_bounded_to_100_events() {
-        let (state, _) = test_state(1);
+        let (state, clock) = test_state(1);
         let created = state.create_event().await.expect("create event");
 
-        for index in 0..105 {
+        for index in 0_u64..105 {
+            // Advance clock past per-event publish rate window each iteration.
+            clock.store(2 + index, Ordering::SeqCst);
             state
                 .publish_metadata(
                     &created.event_id,
@@ -867,6 +923,76 @@ mod tests {
             .await
             .expect("latest");
         assert_eq!(latest.metadata, payload);
+    }
+
+    #[tokio::test]
+    async fn publish_rate_limit_returns_429_when_exceeded() {
+        let clock = Arc::new(AtomicU64::new(1));
+        let state = RelayState::with_clock(
+            AppConfig {
+                max_publishes_per_event_per_sec: 2,
+                ..AppConfig::for_tests()
+            },
+            {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+        );
+        let created = state.create_event().await.expect("create event");
+
+        for _ in 0..2 {
+            state
+                .publish_metadata(
+                    &created.event_id,
+                    &created.broadcaster_token,
+                    PublishMetadataRequest(json!({"x": 1})),
+                )
+                .await
+                .expect("publish under limit");
+        }
+
+        let err = state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"x": 1})),
+            )
+            .await
+            .expect_err("over limit");
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+
+        clock.store(2, Ordering::SeqCst);
+        state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"x": 1})),
+            )
+            .await
+            .expect("next-window publish accepted");
+    }
+
+    #[tokio::test]
+    async fn create_rate_limit_returns_429_when_exceeded() {
+        let clock = Arc::new(AtomicU64::new(1));
+        let state = RelayState::with_clock(
+            AppConfig {
+                max_creates_per_sec: 2,
+                ..AppConfig::for_tests()
+            },
+            {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+        );
+
+        state.create_event().await.expect("first");
+        state.create_event().await.expect("second");
+        let err = state.create_event().await.expect_err("third");
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+
+        clock.store(2, Ordering::SeqCst);
+        state.create_event().await.expect("next-window create");
     }
 
     #[tokio::test]

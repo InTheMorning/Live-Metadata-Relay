@@ -257,6 +257,54 @@ async fn publish_without_bearer_token_returns_401() {
 }
 
 #[tokio::test]
+async fn lowercase_bearer_scheme_is_accepted() {
+    let router = test_app();
+    let created = create_event(router.clone()).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("bearer {}", created.broadcaster_token),
+                )
+                .body(Body::from(json!({"hello": "world"}).to_string()))
+                .expect("publish request"),
+        )
+        .await
+        .expect("publish response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cors_preflight_returns_allow_origin() {
+    let response = test_app()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/liveitems")
+                .header("origin", "https://app.example.com")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .expect("preflight request"),
+        )
+        .await
+        .expect("preflight response");
+
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_some(),
+        "missing access-control-allow-origin header"
+    );
+}
+
+#[tokio::test]
 async fn publish_with_wrong_token_returns_403() {
     let router = test_app();
     let created = create_event(router.clone()).await;

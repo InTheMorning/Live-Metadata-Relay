@@ -4,6 +4,17 @@
 
 The service is intentionally memory-only for v1. Clients create a live item, receive a one-time broadcaster token, publish metadata with that token, and public listeners can receive `remoteValue` updates over Socket.IO. HTTP snapshot reads and SSE are kept as fallback/debug transports.
 
+## Clients And Neighbors
+
+| Component | Repository | Relation |
+|---|---|---|
+| `musicindex-live-publisher` | `musicindex-live-publisher` | The broadcaster. Sends the direct live value payload. |
+| `v4vmm` | `v4vmm` | Registers live items, keeps the event registry and the tokens, and reads snapshots to show what listeners receive. Sends no payloads. |
+| Listener apps | external | Read `remoteValue` over Socket.IO, or the HTTP and SSE fallbacks. |
+
+Read `docs/interoperability.md` before you change a route, a body form, or the
+state model. Those choices constrain three other repositories.
+
 ## Service Routes
 
 By default the relay binds to `127.0.0.1:8018`. It serves these routes at whatever origin and path layout the host chooses to expose:
@@ -62,7 +73,9 @@ Request body:
 }
 ```
 
-This wrapped request body is what the v4vmm client sends. The path `event_id` and body `event_id` must match.
+The path `event_id` and body `event_id` must match.
+
+The wrapped form is a debug and inspection shape. Listener apps read the direct form below, so a broadcaster that wants payment splits to reach listeners must send the direct form. See `docs/interoperability.md`.
 
 For compatibility with the widely used Socket.IO live value implementation, the relay also accepts the live value payload directly:
 

@@ -70,6 +70,15 @@ invalid, and listeners must tune to a new event identifier.
 `v4vmm` therefore keeps its own registry of the events that it created, and
 reports a dead event to the operator instead of a silent replacement.
 
+### An idle event expires
+
+The reaper removes an event when its last activity is older than the TTL. The
+default is 24 hours.
+
+An event therefore dies with no restart. A weekly show that reserves an
+identifier on Monday finds it gone on Saturday. Consumers see the same `404`
+for both death modes, so no consumer needs to separate them.
+
 ### No list route and no delete route
 
 This service cannot tell a client which events it owns. A client that needs a
@@ -92,8 +101,11 @@ a log.
 ### Long-lived live items
 
 A weekly show and a permanent station both need an event that survives a
-restart of this process. Today every restart forces new identifiers and a new
-round of listener tuning.
+restart of this process and the idle TTL. Today a restart forces new
+identifiers and a new round of listener tuning, and a quiet day does the same.
+
+ADR 0001 in this repository proposes the decision, and
+`docs/plans/adr-0001-reserved-live-items-phase-plan.md` holds the work.
 
 The requirement, from the 2026-09-06 chain review:
 
@@ -104,6 +116,26 @@ The requirement, from the 2026-09-06 chain review:
 
 This is a decision for this repository. `v4vmm` ADR 0059 records it as
 follow-up work and its event registry already stores what a resume needs.
+
+### Per-transport delay for live payloads
+
+`musicindex-live-publisher` holds each payload for a configured stream delay
+before it sends the payload here. The delay exists so a live listener's app
+flips the value block near the moment that listener hears the track change,
+after the encoder, the icecast queue, and the player buffer.
+
+That delay is a property of live delivery. It is not a property of the audio.
+Applying it before the payload reaches this service means every consumer
+receives the delayed version, including a snapshot read that a control surface
+uses to show what listeners receive.
+
+The question for this repository: should the delay be applied here, on the
+socket.io emission only, instead of at the publisher? The publisher would then
+send on sight, this service would hold the socket.io emission for the target
+delay, and the HTTP snapshot would show the current truth without a delay.
+
+Not decided. It needs a measurement of the real post-icecast delay first,
+which nobody has taken. Recorded so the option is not lost.
 
 ## References
 

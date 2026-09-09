@@ -1,5 +1,10 @@
 # Reserved Live Items Task 002: Reserved Class And Admin Credential
 
+Status: Ready - 2026-09-09. Do after 001.
+
+Every criterion in this packet is mechanical. This service has no user
+interface, so it has no visual criteria and needs no operator check.
+
 ## Goal
 
 Add the reserved item class, an admin credential in configuration, and a route
@@ -72,7 +77,50 @@ that reserves a durable live item. Write identity to a file.
 9. Add the new death-mode information to `docs/interoperability.md`: a reserved
    item survives a restart, and an ephemeral item does not.
 
+## Contract With v4vmm
+
+`v4vmm` reads this response into `LiveItemCreateResponse` in `src/api.rs`. A
+renamed or absent required field fails that parse, and the operator sees a
+transport error with no cause. Hold these names.
+
+```json
+{
+  "event_id": "01J8Z...",
+  "broadcaster_token": "...",
+  "metadata_url": "https://relay.example/v1/liveitems/01J8Z.../metadata",
+  "events_url": "https://relay.example/v1/liveitems/01J8Z.../events",
+  "remote_value_url": "https://relay.example/...",
+  "socket_io_url": "https://relay.example/...",
+  "label": "weekly show"
+}
+```
+
+- `event_id`, `broadcaster_token`, `metadata_url`, and `events_url` are
+  required. `v4vmm` fails the whole parse without any one of them.
+- `remote_value_url` and `socket_io_url` are optional, and absent is not `null`.
+- `label` is new in this packet. `v4vmm` ignores a field it does not know, so
+  adding it breaks nothing.
+- The token appears once, in this response. No later read returns it.
+
+Status codes, because the caller separates these without reading text:
+
+| Code | Meaning |
+|---|---|
+| 201 | reserved, and the body holds the token |
+| 401 | no credential |
+| 403 | wrong credential |
+| 404 | no admin token is configured, so the feature is off |
+| 409 | the label is already reserved |
+
+**`404` means the feature is off, not that the route is missing.** A caller that
+reads `404` as "this relay is too old" is correct either way, and both answers
+lead the operator to the same place.
+
 ## Acceptance Criteria
+
+- The response holds the four required field names that `v4vmm` parses, and
+  the token appears only there.
+- The five status codes are distinct, and `404` means the feature is off.
 
 - The ephemeral create route behaves exactly as before.
 - The reserve route is unavailable with no admin token configured.

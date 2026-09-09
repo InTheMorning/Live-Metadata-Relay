@@ -1,5 +1,10 @@
 # Reserved Live Items Task 004: List And Delete Reserved Items
 
+Status: Ready - 2026-09-09. Do after 003.
+
+Every criterion in this packet is mechanical. This service has no user
+interface, so it has no visual criteria and needs no operator check.
+
 ## Goal
 
 Add two admin routes so an operator can see the reserved items and remove one.
@@ -66,7 +71,39 @@ Ephemeral items stay invisible.
    and delete reserved items, and that ephemeral items still need a client-side
    registry.
 
+## Contract With v4vmm
+
+`GET /v1/liveitems/reserved` returns one object that holds a `reserved` array.
+It is not a bare array. A bare array leaves no room for a count or a cursor, and
+a later addition then changes the shape a caller already parses.
+
+```json
+{
+  "reserved": [
+    {
+      "event_id": "01J8Z...",
+      "label": "weekly show",
+      "created_at": "2026-09-09T18:00:00Z",
+      "last_publish_at": "2026-09-09T19:30:00Z"
+    }
+  ]
+}
+```
+
+- An empty list prints `{"reserved": []}`, never an absent key and never `null`.
+- **No broadcaster token appears here.** Task 002 returns the token once, at
+  reserve time. This route is a list of identities, not of secrets.
+- `last_publish_at` is absent when the item has never published. It is not the
+  epoch and it is not an empty string.
+
+`DELETE /v1/liveitems/reserved/{event_id}` answers `204` on success and `404`
+when no reserved item holds that identifier. The two `404` cases, a missing item
+and a disabled feature, are told apart by whether the credential was accepted.
+
 ## Acceptance Criteria
+
+- `GET` returns `{"reserved": [...]}`, and an empty list keeps the key.
+- No response of either route holds a broadcaster token.
 
 - The list holds reserved items only, and no secret.
 - Delete is permanent and disconnects subscribers.

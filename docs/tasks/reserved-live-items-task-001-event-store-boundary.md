@@ -1,5 +1,11 @@
 # Reserved Live Items Task 001: Event Store Boundary
 
+Status: Ready - 2026-09-09. Do first. Every later packet writes through the
+boundary this one adds.
+
+Every criterion in this packet is mechanical. This service has no user
+interface, so it has no visual criteria and needs no operator check.
+
 ## Goal
 
 Add an `EventStore` boundary with an in-memory implementation, and route every

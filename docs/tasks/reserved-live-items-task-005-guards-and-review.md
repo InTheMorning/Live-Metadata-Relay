@@ -1,5 +1,10 @@
 # Reserved Live Items Task 005: Guards, Runbook, And Review
 
+Status: Ready - 2026-09-09. Gate task. Do last.
+
+Every criterion in this packet is mechanical. This service has no user
+interface, so it has no visual criteria and needs no operator check.
+
 ## Goal
 
 Close ADR 0001. Test every invariant, write the operator runbook, write the
@@ -69,7 +74,26 @@ review, and reconcile the statuses.
 8. Confirm `docs/interoperability.md` matches the shipped behavior, and confirm
    the two neighbor repositories describe the same limits.
 
+## Reconcile The Other Repositories
+
+This feature changes what a `v4vmm` operator can do, so closing it is not a
+`splitkit` matter alone.
+
+Before this packet is complete:
+
+- Confirm that the reserve response still holds the four field names that
+  `v4vmm` parses into `LiveItemCreateResponse`. Task 002 pins them.
+- Record in `v4vmm` at `docs/plans/broadcast-chain-delivery-order.md` that the
+  reserved item class exists, so an operator stops losing an event to the
+  24-hour idle rule.
+- Note in that plan that `v4vmm` has no packet yet for reserving an item from
+  the app. This packet does not write one, and it must not leave the gap
+  unrecorded.
+
 ## Acceptance Criteria
+
+- The reserve response field names match what `v4vmm` parses.
+- The `v4vmm` delivery order records the new class and the missing packet.
 
 - Every ADR 0001 invariant has a test or a recorded reason.
 - A test proves the state file holds no payload.

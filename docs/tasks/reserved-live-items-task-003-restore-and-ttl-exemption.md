@@ -1,5 +1,11 @@
 # Reserved Live Items Task 003: Restore On Startup And TTL Exemption
 
+Status: Ready - 2026-09-09. Do after 002. This packet is the reason ADR 0001
+exists: without it a reserved item still dies with the process or the reaper.
+
+Every criterion in this packet is mechanical. This service has no user
+interface, so it has no visual criteria and needs no operator check.
+
 ## Goal
 
 Load reserved identity at startup so a stored broadcaster token stays valid.
